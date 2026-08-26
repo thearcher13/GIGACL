@@ -1,0 +1,38 @@
+# GIGACL runtime dependencies.
+#
+# Pinned, not floated. An unpinned ">=" resolves to whatever PyPI is serving on
+# the day of the install, which means the switch estate is one `pip install`
+# away from a version nobody tested against it. These are the versions the test
+# suite runs against.
+#
+# Only direct dependencies are listed. Transitive ones (starlette, anyio,
+# cryptography's cffi, netmiko's textfsm, and so on) are resolved by pip, which
+# keeps this file readable and keeps platform-specific wheels -- uvloop is
+# installed on Linux and skipped on Windows -- pip's problem rather than ours.
+#
+# Install with:  pip install -r requirements.txt
+
+# Web framework and ASGI server. The [standard] extra brings the websocket
+# implementation the switch terminal needs, plus uvloop/httptools where the
+# platform supports them.
+fastapi==0.140.13
+uvicorn[standard]==0.51.0
+
+# Switch access. netmiko drives the IOS/NX-OS sessions; paramiko is the SSH
+# transport underneath it and is used directly for the interactive terminal.
+netmiko==4.7.0
+paramiko==4.0.0
+
+# Storage.
+SQLAlchemy==2.0.51
+
+# Credentials: bcrypt hashes the sign-in passwords, jose signs the session
+# tokens, cryptography encrypts the stored switch passwords at rest.
+bcrypt==5.0.0
+python-jose[cryptography]==3.5.0
+cryptography==49.0.0
+
+# Request parsing and settings.
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-multipart==0.0.32
