@@ -230,6 +230,9 @@ function releasePresence() {
 
 function clearAuth() {
   closeAllTerminalWindows();
+  // A different Beehive next time. Rolled here, while the account it belongs
+  // to is still known -- the key is per-username.
+  if (beehiveUnlocked()) rollBeehiveForm();
   /* Everything on screen describes the account that is leaving. Cleared here
      as well as in resetAllSectionState(), because that one spares the command
      bar unless it is showing a save result -- a distinction that matters
@@ -241,14 +244,17 @@ function clearAuth() {
   pendingRequestAccess = null;
   // Switch-management state describes the account that is leaving.
   GRANT.users = []; GRANT.granted = [];
-  if ($('sw-add-results')) $('sw-add-results').innerHTML = '';
-  if ($('sw-granted-list')) $('sw-granted-list').innerHTML = '';
-  if ($('sw-grant-users')) $('sw-grant-users').innerHTML = '';
+  /* Wipes the pages AND the modals -- typed-but-unsaved work included. This
+     runs on every way out (the button, the idle timeout, an expired token,
+     an account that no longer exists), so no path can leave one person's
+     input on screen for the next one. */
+  resetForAccountChange();
   clearIdleTimer();
   stopSessionWatch();
   S.token = S.username = S.role = null; S.maga = 'byte'; S.megaVisible = false;
   S.switches = []; S.swIds = []; S.logs = []; S.logsView = [];
   S.sites = []; S.siteOrder = []; S.switchOrder = [];
+  S.builtinSites = []; S.customSites = []; S.roles = [];
   localStorage.removeItem('giga_token');
   localStorage.removeItem('giga_username');
   localStorage.removeItem('giga_role');
@@ -779,11 +785,11 @@ const THEME_CATALOG = {
   carbon:  { name: 'Carbon', note: 'True black and bright white. The sharpest contrast on offer.',
              swatch: ['#0b0b0d', '#59a5ff', '#a68bff'] },
   light:   { name: 'Daylight', note: 'Midnight turned over: the same indigo on clean white.',
-             swatch: ['#eef2f9', '#4f57e8', '#7c4ddb'] },
+             swatch: ['#e3e9f4', '#4b55e0', '#7a4ddb'] },
   glacier: { name: 'Glacier', note: 'Pale blue right through, so nothing on screen is pure white.',
-             swatch: ['#cfe3ec', '#08697d', '#2b7fa6'] },
+             swatch: ['#c9dfeb', '#0a7392', '#2f8fbe'] },
   evermore:{ name: 'Evermore', note: 'Warm paper and deep teal. Built for the long afternoon.',
-             swatch: ['#efe7d7', '#0f7168', '#a4622b'] },
+             swatch: ['#f0e6d5', '#0e7a6c', '#b0632a'] },
 };
 const DEFAULT_THEME = 'dark';
 
@@ -1164,11 +1170,87 @@ function openModal(id)  {
   m.hidden = false;
   enhanceSelects(m);
 }
+/* What each modal forgets the moment it closes. A modal is a scratchpad: what
+   was typed into it, and what it reported back, belong to the one time it was
+   open — reopening it must not resume somebody's abandoned half-filled form or
+   still be showing the last run's results. That holds for the same person in
+   the same session, not only across a sign-out.
+   m-confirm is deliberately absent: its callers read the extra inputs it
+   renders (the VPC "apply to both" radio) after the promise resolves, which
+   is after the modal has already been hidden. */
+const MODAL_CLEANUP = {
+  'm-switches': () => {
+    resetSwitchForm();
+    $('sw-add-results').innerHTML = '';
+    // The filter is part of the same scratchpad, so drop it and redraw the
+    // list — the next visit should open on everything, not on a stale search.
+    if ($('sw-mgr-search')) $('sw-mgr-search').value = '';
+    buildSwitchManager();
+  },
+  'm-editsw': () => {
+    resetFieldsIn($('m-editsw'));
+    $('esw-enable-wrap').style.display = 'none';
+    fieldError($('esw-err'), '');
+    $('esw-name').textContent = '';
+    editSwId = null;
+  },
+  'm-vpc': () => {
+    $('vpc-name').textContent = '';
+    vpcId = null;
+  },
+  'm-renameuser': () => {
+    $('ru-name').value = '';
+    $('ru-current').textContent = '';
+    fieldError($('ru-err'), '');
+    renameUserId = null;
+  },
+  'm-resetpw': () => {
+    $('rp-new').value = ''; $('rp-cf').value = '';
+    $('rp-user').textContent = '';
+    fieldError($('rp-err'), '');
+    resetPwId = null;
+  },
+  'm-trustedhosts': () => {
+    $('th-hosts').value = '';
+    $('th-user').textContent = '';
+    fieldError($('th-err'), '');
+  },
+  'm-view-rule-edit': () => {
+    $('view-edit-rule').value = '';
+    $('view-edit-context').innerHTML = '';
+    $('view-edit-output').innerHTML = '';
+    fieldError($('view-edit-error'), '');
+    viewerEditState = null;
+  },
+  'm-og-edit': () => {
+    $('og-edit-member').value = '';
+    $('og-edit-context').innerHTML = '';
+    $('og-edit-output').innerHTML = '';
+    fieldError($('og-edit-error'), '');
+    ogEditState = null;
+  },
+  'm-report': () => {
+    $('report-body').innerHTML = '';
+    $('report-acl-name').textContent = '';
+    ['btn-report-md', 'btn-report-html'].forEach(bid => {
+      const b = $(bid);
+      if (b) { b.disabled = true; b.onclick = null; }
+    });
+  },
+  'm-log': () => {
+    ['ld-time', 'ld-level', 'ld-user', 'ld-ip', 'ld-msg', 'ld-desc']
+      .forEach(sid => { const c = $(sid); if (c) c.textContent = ''; });
+  },
+  'm-pick': () => { $('pick-body').innerHTML = ''; },
+};
+
 function closeModal(id) {
   const m = $(id);
   if (!m) return;
   closeAllSelects();
   m.hidden = true;
+  const forget = MODAL_CLEANUP[id];
+  if (forget) forget();
 }
 
 /* Generic confirm dialog. Returns a Promise<boolean>. */
@@ -1456,8 +1538,31 @@ function clearPageResults(pageId) {
   clearCommandResultBar();
 }
 
+/* Put one field back to what the markup declares rather than blanket-blanking
+   it: a select whose default is a real choice (Type = IOS) and a box that
+   ships ticked have to come back the way they started, or a "clean" form is
+   quietly lying about what it will submit. */
+function resetField(f) {
+  if (f.type === 'checkbox' || f.type === 'radio') { f.checked = f.defaultChecked; return; }
+  if (f.tagName === 'SELECT') {
+    const def = [...f.options].findIndex(o => o.defaultSelected);
+    f.selectedIndex = def >= 0 ? def : 0;
+    return;
+  }
+  if (['button', 'submit', 'reset', 'file', 'hidden'].includes(f.type)) return;
+  f.value = f.defaultValue || '';
+}
+
+/* Blank every field in a subtree. The enhanced selects keep their own button
+   label, so a value put back without a refresh would leave the previous
+   account's choice sitting on screen. */
+function resetFieldsIn(root) {
+  els('input, textarea, select', root).forEach(resetField);
+  els('select', root).forEach(s => { if (s._selRefresh) s._selRefresh(); });
+}
+
 /* Full reset of every section: every result/output container emptied,
-   every plain field blanked, every select back to its first option, and
+   every field back to the value the markup declares, and
    growable entry lists (object groups, time ranges, templates) collapsed
    back to their clean starting state. Used on logout, on switching pages,
    and on switching the selected switch(es) — none of those should leave
@@ -1480,9 +1585,7 @@ function resetAllSectionState() {
     });
   }
 
-  els('.page input[type="text"], .page input[type="search"], .page input[type="number"], '
-    + '.page input:not([type]), .page textarea').forEach(i => { i.value = ''; });
-  els('.page select').forEach(sel => { sel.selectedIndex = 0; });
+  els('.page').forEach(resetFieldsIn);
   ['og-entries', 'tr-entries'].forEach(id => {
     const c = $(id);
     if (c) c.innerHTML = '';
@@ -1499,6 +1602,71 @@ function clearSwitchData() {
   // previous selection can't overwrite the newly selected switch's data.
   S.dataGen++;
   resetAllSectionState();
+}
+
+/* Content the modals build at runtime. Emptied on sign-out with the fields,
+   so nothing of the previous account is left behind a closed modal. */
+const MODAL_CONTENT_CONTAINERS = [
+  'sw-add-results', 'sw-granted-list', 'sw-grant-users', 'sw-mgr-list',
+  'sw-grant-access-hint', 'report-body', 'pick-body',
+  'view-edit-context', 'view-edit-output', 'og-edit-context', 'og-edit-output',
+  'cf-cli', 'cf-extra', 'ld-desc',
+];
+/* Titles and detail lines the modals fill in for whatever they were opened on. */
+const MODAL_TEXT_SLOTS = [
+  'esw-name', 'vpc-name', 'report-acl-name', 'ru-current', 'rp-user', 'th-user',
+  'ld-time', 'ld-level', 'ld-user', 'ld-ip', 'ld-msg',
+];
+
+/* Every modal, closed and blanked. Modal fields live outside .page, so the
+   sweep in resetAllSectionState() never reached them -- which is how a
+   half-typed switch (IP, SSH username, even the password) survived a sign-out
+   and greeted the next person to sign in. */
+function resetAllModalState() {
+  closeAllSelects();
+  els('.mbg').forEach(m => { m.hidden = true; });
+  // Whatever a modal forgets on an ordinary close, it forgets here too --
+  // then the sweep below catches the fields and containers no single modal
+  // owns (m-confirm's included, which a normal close has to leave alone).
+  Object.values(MODAL_CLEANUP).forEach(forget => forget());
+  els('.mbg').forEach(m => {
+    resetFieldsIn(m);
+    els('.form-error', m).forEach(e => { e.textContent = ''; e.hidden = true; });
+  });
+  MODAL_CONTENT_CONTAINERS.forEach(id => { const c = $(id); if (c) c.innerHTML = ''; });
+  MODAL_TEXT_SLOTS.forEach(id => { const c = $(id); if (c) c.textContent = ''; });
+  if ($('cf-cli-wrap')) $('cf-cli-wrap').hidden = true;
+  if ($('sw-mgr-bulk-actions')) $('sw-mgr-bulk-actions').hidden = true;
+  if ($('sw-grant-block')) $('sw-grant-block').hidden = true;
+  if ($('sw-granted-block')) $('sw-granted-block').hidden = true;
+  // Fields whose visibility is driven by a checkbox: the box is back to its
+  // default above, so the panel it controls has to follow it.
+  if ($('esw-enable-wrap')) $('esw-enable-wrap').style.display = 'none';
+  resetSwitchForm();
+  // Nobody is waiting on a modal any more.
+  pickResolve = null;
+  vpcId = editSwId = renameUserId = resetPwId = null;
+  ogEditState = null;
+  viewerEditState = null;
+}
+
+/* Everything on screen and everything cached belongs to the account that is
+   leaving. Used on every sign-out path and again on sign-in, so a second
+   person at the same browser starts from a blank app rather than inheriting
+   the first one's half-finished work. */
+function resetForAccountChange() {
+  resetAllSectionState();
+  resetAllModalState();
+  templatesCache = [];
+  templatesViewDirection = {};
+  tplShareCandidates = [];
+  managedUsers = [];
+  latestDeniedAccess = null;
+  megaRuleSuggestion = null;
+  lastRedundantResult = null;
+  lastSummaryResult = null;
+  DASH.slice = null; DASH.health = null; DASH.detail = null;
+  DASH.detailData = null; DASH.detailLabel = ''; DASH.switchOwner = '';
 }
 
 function closePicker() {
@@ -2111,7 +2279,10 @@ function showLogin() {
   $('app-screen').hidden = true;
   $('maga-stage').hidden = true;
   $('login-screen').hidden = false;
+  // The next person at this browser is not necessarily the last one.
+  $('login-username').value = '';
   $('login-password').value = '';
+  fieldError($('login-error'), '');
   setTimeout(() => $('login-username')?.focus(), 60);
 }
 
@@ -6067,11 +6238,56 @@ async function loadUsers() {
 
 /* ══════════ MEGAS ══════════ */
 const MAGA_CATALOG = {
-  byte:  { name: 'Vibe Coder', note: 'A little robot coding away on its chest screen.' },
-  spark: { name: 'RJ45',       note: 'An Ethernet plug that chases packets.' },
-  orbit: { name: 'Ping',       note: 'A floating Wi-Fi scanner and signal finder.' },
-  moss:  { name: 'Rack',       note: 'A miniature server rack with busy LEDs.' },
+  byte:   { name: 'Vibe Coder', note: 'A little robot coding away on its chest screen. Press it twice and the laptop comes out.' },
+  spark:  { name: 'RJ45',       note: 'An Ethernet plug that chases packets.' },
+  orbit:  { name: 'Ping',       note: 'A floating Wi-Fi scanner and signal finder.' },
+  moss:   { name: 'Rack',       note: 'A miniature server rack with busy LEDs.' },
+  fire:   { name: 'Fire Mega',  note: 'A brick firewall with a burning crest that bounces packets off its wall.' },
+  giga:   { name: 'Giga Mega',  note: 'Built for speed — spinning wheels, a swept crest and three afterimages it never quite outruns.' },
+  tunnel: { name: 'Tunnel Mega', note: 'A courier standing in an IPsec tunnel, sealing packets as they pass through.' },
+  boss:   { name: 'B0$$ Mega',  note: 'Crown, heavy brows, moustache and a rank star. Runs the place.' },
+  beehive:{ name: 'Beehive', locked: true,
+            note: 'The hidden one. Takes a different shape every time you sign in.' },
 };
+
+/* ══════════ BEEHIVE — the hidden Mega ══════════
+   Not in the picker until you find it, and never the same twice: it keeps one
+   of eight shapes, and rolls a new one every time you sign out. */
+const BEEHIVE_FORMS = ['keeper', 'cr7', 'gym', 'shop', 'notes', 'coffee', 'neteng', 'bee'];
+
+const beehiveUnlockKey = () => `giga_beehive_${S.username || 'user'}`;
+const beehiveFormKey   = () => `giga_beehive_form_${S.username || 'user'}`;
+
+/* Wearing it counts as having found it. The flag is local to this browser, but
+   the choice itself lives on the server, so an account that already picked
+   Beehive elsewhere does not lose it by signing in somewhere new. */
+function beehiveUnlocked() {
+  return S.maga === 'beehive' || localStorage.getItem(beehiveUnlockKey()) === 'yes';
+}
+
+function beehiveForm() {
+  const form = localStorage.getItem(beehiveFormKey());
+  return BEEHIVE_FORMS.includes(form) ? form : BEEHIVE_FORMS[0];
+}
+
+/* Rolled on the way out rather than on the way in, so the shape has already
+   changed by the time the next session draws it. Never the same one twice
+   running -- a "random" shape that repeats reads as a bug. */
+function rollBeehiveForm() {
+  const current = localStorage.getItem(beehiveFormKey());
+  const pool = BEEHIVE_FORMS.filter(form => form !== current);
+  const next = pool[Math.floor(Math.random() * pool.length)];
+  localStorage.setItem(beehiveFormKey(), next);
+  return next;
+}
+
+function unlockBeehive() {
+  if (beehiveUnlocked()) return false;
+  localStorage.setItem(beehiveUnlockKey(), 'yes');
+  rollBeehiveForm();
+  renderMagaSelector();
+  return true;
+}
 
 /* One user's Mega as it appears in the users table. Split out so that choosing
    a new Mega can refresh your own row in place, rather than leaving it stale
@@ -6083,7 +6299,8 @@ function megaBadgeMarkup(mega) {
 
 function magaMarkup(type, compact = false) {
   const safeType = MAGA_CATALOG[type] ? type : 'byte';
-  return `<span class="maga-pet ${compact ? 'maga-pet-compact' : ''}" data-maga="${safeType}" aria-hidden="true">
+  const form = safeType === 'beehive' ? ` data-form="${beehiveForm()}"` : '';
+  return `<span class="maga-pet ${compact ? 'maga-pet-compact' : ''}" data-maga="${safeType}"${form} aria-hidden="true">
     <span class="maga-shadow"></span>
     <span class="maga-tail"><i></i></span>
     <span class="maga-antenna"><i></i></span>
@@ -6100,12 +6317,14 @@ function renderMagaStage() {
   const stage = $('maga-stage');
   if (!stage) return;
   megaRuleSuggestion = null;
+  stopMegaPlay(stage);
   stage.classList.remove(
     'is-search-open', 'has-activity', 'is-excited', 'is-curious',
     'is-processing', 'is-scanning', 'is-dragging', 'has-rule-suggestion'
   );
   const type = MAGA_CATALOG[S.maga] ? S.maga : 'byte';
-  stage.innerHTML = `<div class="mega-status-bubble" aria-live="polite">
+  stage.innerHTML = `<span class="mega-shout" aria-live="polite" hidden></span>
+  <div class="mega-status-bubble" aria-live="polite">
     <span class="mega-live-status" data-mega-status hidden></span>
     <button type="button" class="mega-rule-suggestion" hidden>
       <strong>Access is denied</strong><span>Add an ACL rule</span>
@@ -6128,6 +6347,7 @@ function renderMagaStage() {
     updateMegaActivityBubble();
   });
   startMegaLife();
+  startBeehiveShots();
 }
 
 function renderMagaSelector() {
@@ -6135,7 +6355,9 @@ function renderMagaSelector() {
   if (!box) return;
   const busy = appActivities.size > 0;
   box.setAttribute('aria-busy', busy ? 'true' : 'false');
-  box.innerHTML = Object.entries(MAGA_CATALOG).map(([id, maga]) => {
+  box.innerHTML = Object.entries(MAGA_CATALOG)
+    .filter(([, maga]) => !maga.locked || beehiveUnlocked())
+    .map(([id, maga]) => {
     const selected = S.maga === id;
     /* The name/description are deliberately not drawn -- the artwork is the
        label here. They stay on title/aria-label so hovering and screen
@@ -6150,7 +6372,20 @@ function renderMagaSelector() {
 }
 
 async function chooseMaga(type, button) {
-  if (!MAGA_CATALOG[type] || type === S.maga || appActivities.size) return;
+  if (!MAGA_CATALOG[type] || appActivities.size) return;
+  /* Beehive is the shape-shifter: pressing its tile rolls a new shape, even
+     when it is already selected. Deliberately quiet -- no toast for it, the
+     change is the feedback. */
+  if (type === 'beehive') {
+    rollBeehiveForm();
+    if (type === S.maga) {
+      renderMagaSelector();
+      renderMagaStage();
+      button?.blur();
+      return;
+    }
+  }
+  if (type === S.maga) return;
   const state = $('maga-save-state');
   els('.maga-option', $('maga-options')).forEach(b => { b.disabled = true; });
   if (state) state.textContent = 'Saving your Mega…';
@@ -6182,6 +6417,76 @@ let megaIgnoreClick = false;
 let megaLifeTimer = null;
 let megaClickTimer = null;
 let megaRuleSuggestion = null;
+
+/* ── playtime ──
+   A press is a poke; pressing again is asking for a show. The level is kept
+   between presses so the third poke is more of a show than the first (the
+   Vibe Coder types faster, the Boss issues orders faster), and it lapses back to
+   calm on its own once the pressing stops. */
+let megaPlayLevel = 0;
+let megaPlayTimer = null;
+let megaExcitedTimer = null;
+let megaShoutTimer = null;
+
+/* What a shape has to say when you press it more than once. Only the coffee
+   Beehive has anything to say so far. */
+const MEGA_SHOUTS = { coffee: 'baaaarghamadi' };
+
+function megaShout(stage) {
+  const pet = el('.maga-pet', stage);
+  const bubble = el('.mega-shout', stage);
+  if (!pet || !bubble || pet.dataset.maga !== 'beehive') return;
+  const line = MEGA_SHOUTS[pet.dataset.form || ''];
+  if (!line) return;
+  bubble.textContent = line;
+  bubble.hidden = false;
+  // Restart the pop rather than letting a second burst land on a half-faded
+  // bubble.
+  bubble.classList.remove('is-out');
+  void bubble.offsetWidth;
+  bubble.classList.add('is-out');
+  clearTimeout(megaShoutTimer);
+  megaShoutTimer = setTimeout(() => {
+    megaShoutTimer = null;
+    bubble.hidden = true;
+    bubble.classList.remove('is-out');
+  }, 2800);
+}
+const MEGA_PLAY_CLASSES = ['is-playing', 'play-2', 'play-3'];
+
+function stopMegaPlay(stage) {
+  stopBeehiveShots();
+  clearTimeout(megaPlayTimer);
+  clearTimeout(megaExcitedTimer);
+  clearTimeout(megaShoutTimer);
+  megaPlayTimer = megaExcitedTimer = megaShoutTimer = null;
+  megaPlayLevel = 0;
+  if (stage) stage.classList.remove('is-excited', ...MEGA_PLAY_CLASSES);
+}
+
+/* One hop for the press itself, then the Mega's own party trick for as long
+   as the poking keeps up. */
+function megaPlay(stage) {
+  if (!stage) return;
+  clearTimeout(megaPlayTimer);
+  clearTimeout(megaExcitedTimer);
+  megaPlayLevel = Math.min(megaPlayLevel + 1, 3);
+  stage.classList.remove('is-excited');
+  // Reflow, or re-adding the class in the same frame does not restart the hop.
+  void stage.offsetWidth;
+  stage.classList.add('is-excited', 'is-playing');
+  stage.classList.toggle('play-2', megaPlayLevel >= 2);
+  stage.classList.toggle('play-3', megaPlayLevel >= 3);
+  megaExcitedTimer = setTimeout(() => {
+    megaExcitedTimer = null;
+    stage.classList.remove('is-excited');
+  }, 900);
+  megaPlayTimer = setTimeout(() => {
+    megaPlayTimer = null;
+    megaPlayLevel = 0;
+    stage.classList.remove(...MEGA_PLAY_CLASSES);
+  }, 1600 + megaPlayLevel * 1100);
+}
 
 function megaVisibilityKey() {
   return `giga_mega_visible_${S.username || 'user'}`;
@@ -6428,6 +6733,40 @@ function endMegaDrag(event) {
   megaDragState = null;
 }
 
+/* Shots at the keeper. Driven from here rather than CSS because the outcome
+   has to be random each time -- a save the first time and a goal the next --
+   and a stylesheet cannot roll dice. */
+let beehiveShotTimer = null;
+
+function stopBeehiveShots() {
+  clearTimeout(beehiveShotTimer);
+  beehiveShotTimer = null;
+}
+
+function startBeehiveShots() {
+  stopBeehiveShots();
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const keeper = () => {
+    const pet = el('.maga-pet', $('maga-stage') || document.body);
+    return pet && pet.dataset.maga === 'beehive' && pet.dataset.form === 'keeper' ? pet : null;
+  };
+  if (!keeper()) return;
+  const queue = () => {
+    beehiveShotTimer = setTimeout(() => {
+      const pet = keeper();
+      if (!pet) return stopBeehiveShots();
+      // He is a good keeper: roughly one in five gets past him.
+      const beaten = Math.random() < 0.2;
+      pet.dataset.shot = beaten ? 'goal' : 'save';
+      beehiveShotTimer = setTimeout(() => {
+        delete pet.dataset.shot;
+        queue();
+      }, beaten ? 1700 : 1300);
+    }, 2400 + Math.random() * 2800);
+  };
+  queue();
+}
+
 function startMegaLife() {
   if (megaLifeTimer || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   const moods = ['is-curious', 'is-processing', 'is-scanning'];
@@ -6643,6 +6982,13 @@ function resetSwitchForm() {
   $('sw-enable').checked = false;
   $('sw-enable-pass').value = '';
   $('sw-enable-wrap').style.display = 'none';
+  // The bulk toggle hides one IP field and shows the other and renames the
+  // button, so putting the box back means putting all three back with it.
+  $('sw-bulk').checked = false;
+  $('sw-ip-single-wrap').hidden = false;
+  $('sw-ip-bulk-wrap').hidden = true;
+  $('btn-addsw').textContent = 'Connect & Save';
+  fieldError($('sw-err'), '');
   els('#sw-grant-users input[type=checkbox]').forEach(c => { c.checked = false; });
   if ($('sw-grant-self')) $('sw-grant-self').checked = false;
   if ($('sw-grant-terminal')) $('sw-grant-terminal').checked = true;
@@ -6934,8 +7280,7 @@ const DASH_TILE_TIP = {
   rules_removed: 'Rules removed from an ACL in this period.',
   failed_operations: 'Operations that the switch rejected or that could not complete.',
   failed_logins: 'Rejected sign-in attempts, including those blocked by a lockout.',
-  signed_in: 'Accounts that used the app within the idle-logout window. '
-           + 'Sessions are not tracked, so this reflects recent activity.',
+  signed_in: 'Signed-in users who were active in the last 5 minutes.',
   switches: () => isSuper()
     ? 'Every switch registered, across every account. A switch two people '
       + 'have each registered counts once for each of them — the entries are '
@@ -7227,9 +7572,11 @@ window.dashFilterSwitchOwner = function (owner) {
   enhanceSelects(box);
 };
 
-/* All of the addresses, not just the newest one: an account being used from
-   two places at once is the thing worth seeing here, and collapsing it to a
-   single address would hide exactly that. */
+/* All of the addresses that are still live, not just the newest one: an
+   account being used from two places at once is the thing worth seeing here.
+   The server has already dropped any address that has gone quiet for longer
+   than the presence window, so somebody who moved from one address to another
+   shows only where they actually are. */
 function dashUserIps(u) {
   const ips = u.ips || [];
   if (!ips.length) return '<span class="dash-muted">unknown</span>';
@@ -7245,14 +7592,13 @@ function renderDashDetail(kind, label, d) {
     return `<div class="card">${head(label)}
       ${d.users.length ? `<div class="t-wrap"><table class="table"><thead><tr>
         <th>User</th><th>Role</th>
-        <th data-tip="Every address this account has been active from in this window.">Signed in from</th>
+        <th data-tip="Addresses used in the last 5 minutes.">Active from</th>
         <th>Last seen</th></tr></thead><tbody>
         ${d.users.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.role)}</td>
           <td>${dashUserIps(u)}</td>
           <td class="t-time">${esc(fmtTime(u.last_seen))}</td></tr>`).join('')}
         </tbody></table></div>`
-        : `<div class="dash-empty">Nobody has used the app recently.
-             Sessions are not tracked, so this only counts recent requests.</div>`}
+        : `<div class="dash-empty">Nobody was active in the last 5 minutes.</div>`}
     </div>`;
   }
 
@@ -7458,7 +7804,7 @@ function renderDashHealth(d) {
       You have no switches registered, so there is nothing to analyse.</div></div>`;
   }
 
-  html += `<div class="card card-pad0"><div class="t-wrap"><table class="table"><thead><tr>
+  html += `<div class="card card-pad0 dash-health"><div class="t-wrap"><table class="table"><thead><tr>
     <th>Switch</th><th>Status</th><th>ACLs</th><th>Rules</th>
     <th>Redundant</th><th>Wrong rules</th>
     <th data-tip="Rules a summary could replace. Suggestions to review, not faults.">Summarizable</th>
@@ -8649,9 +8995,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const c = e.target.closest('[data-close]');
     if (c) closeModal(c.dataset.close);
   });
-  /* close a modal by clicking its dim backdrop */
+  /* close a modal by clicking its dim backdrop -- through closeModal(), or a
+     backdrop click would skip the per-modal cleanup that every other way of
+     closing runs */
   els('.mbg').forEach(bg => bg.addEventListener('mousedown', e => {
-    if (e.target === bg) bg.hidden = true;
+    if (e.target === bg) closeModal(bg.id);
   }));
   /* close custom dropdowns on any outside click
      (the menu now lives on <body>, so check for it explicitly) */
@@ -8765,6 +9113,11 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const d = await api('POST', '/api/auth/token',
         new URLSearchParams({ username: u, password: p }));
+      /* Belt and braces: sign-out already clears everything, but a session
+         that ended some other way (a tab left open on the login screen, a
+         restore that failed) must not hand this account the last one's
+         half-typed work either. */
+      resetForAccountChange();
       setAuth(d.access_token, d.username, d.role, d.mega, d.mega_visible);
       applyTheme(d.theme || DEFAULT_THEME);
       $('login-password').value = '';
@@ -8788,14 +9141,21 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     if (!proceed) return;
     releasePresence();
+    // clearAuth() empties every page and every modal, passwords included.
     clearAuth();
-    resetAllSectionState();
-    els('input[type=password]').forEach(i => { i.value = ''; });
     showLogin();
     info('Signed out', 'Your session has ended.');
   });
 
   $('btn-about').addEventListener('click', () => openModal('m-about'));
+  /* Opening the credit link is the way in. The link still opens normally --
+     this only watches for the click. */
+  $('m-about').addEventListener('click', e => {
+    if (!e.target.closest('.about-link')) return;
+    if (!unlockBeehive()) return;
+    ok('New Mega unlocked', 'Beehive is now in your Mega list. It takes a '
+       + 'different shape every time you sign in.');
+  });
   $('btn-mega-visibility').addEventListener('click', toggleMegaVisibility);
   $('theme-options').addEventListener('click', e => {
     const button = e.target.closest('[data-theme-choice]');
@@ -8841,10 +9201,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.detail > 1) {
       clearTimeout(megaClickTimer);
       megaClickTimer = null;
-      stage.classList.remove('is-excited');
-      void stage.offsetWidth;
-      stage.classList.add('is-excited');
-      setTimeout(() => stage.classList.remove('is-excited'), 900);
+      megaShout(stage);
+      megaPlay(stage);
       return;
     }
     clearTimeout(megaClickTimer);

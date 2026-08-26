@@ -352,7 +352,7 @@ async def logout(cu: User = Depends(get_current_user),
     Clear the presence marker so the signer-out stops counting as active.
 
     Signing out is otherwise entirely client-side, so without this the account
-    kept showing on the dashboard until its last_seen aged past the idle
+    kept showing on the dashboard until its last_seen aged past the presence
     window. This does not revoke the token — there is no revocation list — so
     a request made with it afterwards will mark the account active again,
     which is the honest answer.
@@ -366,7 +366,11 @@ async def logout(cu: User = Depends(get_current_user),
 
 
 ROLE_RANK = {ROLE_USER: 1, ROLE_ADMIN: 2, ROLE_SUPER_ADMIN: 3}
-MEGA_TYPES = ("byte", "spark", "orbit", "moss")
+MEGA_TYPES = ("byte", "spark", "orbit", "moss",
+              "fire", "giga", "tunnel", "boss",
+              # Not offered in the picker until it is found, but the server
+              # still has to accept it when somebody does.
+              "beehive")
 
 # Colour schemes. 'dark' and 'light' keep the ids they have always had, so a
 # browser carrying one in localStorage migrates into users.theme without the
@@ -475,7 +479,7 @@ async def update_role(user_id: int, data: sch.RoleUpdate,
     # theirs at all -- and a session that started under the old role carries
     # stale state until it ends. Revoking their token underneath them would
     # do it silently mid-task; this makes the handover explicit instead.
-    cutoff = _presence_cutoff(db)
+    cutoff = _live_session_cutoff(db)
     if u.last_seen and u.last_seen >= cutoff:
         raise HTTPException(
             409, f"'{u.username}' is still signed in. Ask them to sign out, "
@@ -1624,13 +1628,31 @@ ACTIVITY_KINDS = {
 }
 
 # With no session store, a token stays valid until it expires, so presence can
-# only be inferred from recent traffic. The idle-logout setting is the app's
-# own definition of "still there"; without one, fall back to a quarter hour.
-DEFAULT_PRESENCE_MINUTES = 15
+# only be inferred from recent traffic.
+#
+# Deliberately a short fixed window rather than the idle-logout setting. That
+# setting can be "Never", which says nothing at all about whether anybody is
+# there, and closing the browser is not signing out — the token stays valid
+# for hours, so the account would sit on the dashboard as an active admin long
+# after its owner went home. Five minutes of silence is enough to stop calling
+# somebody active, and the moment they do anything they are back.
+#
+# The same window filters the address list, so an address they have stopped
+# using drops off while an address they have moved to keeps them present.
+PRESENCE_MINUTES = 5
+
+# A session, on the other hand, outlives a quiet spell: it ends when the idle
+# timeout fires or the token expires, not when somebody stops clicking. Code
+# asking "is their session still live" wants this, not presence.
+DEFAULT_SESSION_MINUTES = 15
 
 
-def _presence_cutoff(db: Session) -> datetime:
-    minutes = get_app_settings(db).idle_timeout_minutes or DEFAULT_PRESENCE_MINUTES
+def _presence_cutoff() -> datetime:
+    return datetime.utcnow() - timedelta(minutes=PRESENCE_MINUTES)
+
+
+def _live_session_cutoff(db: Session) -> datetime:
+    minutes = get_app_settings(db).idle_timeout_minutes or DEFAULT_SESSION_MINUTES
     return datetime.utcnow() - timedelta(minutes=minutes)
 
 
@@ -1682,7 +1704,7 @@ def _visible_switches(cu: User, db: Session) -> List[Switch]:
 
 
 def _signed_in_users(db: Session) -> List[Dict[str, Any]]:
-    cutoff = _presence_cutoff(db)
+    cutoff = _presence_cutoff()
     users = db.query(User).filter(User.last_seen.isnot(None),
                                   User.last_seen >= cutoff)\
                           .order_by(User.last_seen.desc()).all()

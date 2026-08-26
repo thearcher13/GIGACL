@@ -16,38 +16,64 @@ $VenvPython = Join-Path $Venv 'Scripts\python.exe'
 
 function Fail($message) { Write-Host "ERROR: $message" -ForegroundColor Red; exit 1 }
 
+# Windows PowerShell 5.1 - which is what `powershell.exe` and start.bat run -
+# turns anything a native command writes to stderr into a *terminating* error
+# while ErrorActionPreference is 'Stop', and the `2>$null` redirect is applied
+# too late to stop it. Both `py -3.13` on a machine without 3.13 and pip's
+# warnings write there, so every external command goes through here instead:
+# only the exit code decides success.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$Arguments = @(), [switch]$Quiet)
+    $ErrorActionPreference = 'Continue'
+    if ($Quiet) { & $Exe @Arguments 2>&1 | Out-Null }
+    else        { & $Exe @Arguments 2>&1 | ForEach-Object { Write-Host $_ } }
+    return $LASTEXITCODE
+}
+
 # ---- Python ---------------------------------------------------------------
 # The py launcher ships with the python.org installer and is the reliable way
 # to ask for a specific version; plain `python` on Windows may be the Microsoft
 # Store stub, which is not a working interpreter.
-$python = $null
+$PythonExe  = $null
+$PythonArgs = @()
+
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    foreach ($v in '3.13','3.12','3.11','3.10') {
-        & py "-$v" -c "import sys" 2>$null
-        if ($LASTEXITCODE -eq 0) { $python = @('py', "-$v"); break }
+    foreach ($v in '3.13', '3.12', '3.11', '3.10') {
+        if ((Invoke-Native 'py' @("-$v", '-c', 'import sys') -Quiet) -eq 0) {
+            $PythonExe  = 'py'
+            $PythonArgs = @("-$v")
+            break
+        }
     }
 }
-if (-not $python -and (Get-Command python -ErrorAction SilentlyContinue)) {
-    $ok = & python -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3,10) else 1)" 2>$null
-    if ($LASTEXITCODE -eq 0) { $python = @('python') }
+if (-not $PythonExe -and (Get-Command python -ErrorAction SilentlyContinue)) {
+    $check = 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3,10) else 1)'
+    if ((Invoke-Native 'python' @('-c', $check) -Quiet) -eq 0) { $PythonExe = 'python' }
 }
-if (-not $python) {
+if (-not $PythonExe) {
     Fail "Python 3.10 or newer was not found. Install it from https://www.python.org/downloads/windows/ and tick 'Add Python to PATH'."
 }
-Write-Host "Using $(& $python[0] $python[1..($python.Count-1)] -V)"
+
+$version = & { $ErrorActionPreference = 'Continue'; & $PythonExe @PythonArgs -V 2>&1 } | Select-Object -First 1
+Write-Host "Using $version"
 
 # ---- Virtual environment --------------------------------------------------
 if (-not (Test-Path $VenvPython)) {
     Write-Host 'Creating the virtual environment...'
-    & $python[0] $python[1..($python.Count-1)] -m venv $Venv
-    if ($LASTEXITCODE -ne 0) { Fail 'Could not create the virtual environment.' }
+    if ((Invoke-Native $PythonExe ($PythonArgs + @('-m', 'venv', $Venv))) -ne 0) {
+        Fail 'Could not create the virtual environment.'
+    }
 }
+if (-not (Test-Path $VenvPython)) { Fail "The virtual environment is missing $VenvPython." }
 
 Write-Host 'Installing dependencies...'
-& $VenvPython -m pip install --quiet --upgrade pip
-if ($LASTEXITCODE -ne 0) { Fail 'Could not upgrade pip.' }
-& $VenvPython -m pip install --quiet -r (Join-Path $ProjectDir 'requirements.txt')
-if ($LASTEXITCODE -ne 0) { Fail 'Could not install the dependencies.' }
+if ((Invoke-Native $VenvPython @('-m', 'pip', 'install', '--quiet', '--upgrade', 'pip')) -ne 0) {
+    Fail 'Could not upgrade pip.'
+}
+$req = Join-Path $ProjectDir 'requirements.txt'
+if ((Invoke-Native $VenvPython @('-m', 'pip', 'install', '-r', $req)) -ne 0) {
+    Fail 'Could not install the dependencies.'
+}
 
 # ---- Configuration --------------------------------------------------------
 $envFile = Join-Path $ProjectDir '.env'

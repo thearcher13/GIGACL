@@ -70,9 +70,21 @@ echo Example: set PORT=8080 ^&^& start.bat
 exit /b 0
 
 :setup_failed
-echo ERROR: Setup did not complete. Run setup.ps1 by hand to see why.
+echo.
+echo ERROR: Setup did not complete. Run it by hand to see the full output:
+echo   powershell -ExecutionPolicy Bypass -File "%PROJECT_DIR%setup.ps1"
+call :hold
 exit /b 1
 
 :install_failed
+echo.
 echo ERROR: Could not install the project dependencies.
+call :hold
 exit /b 1
+
+rem Launched from Explorer the console closes the instant this script ends, so
+rem an error message would never be read. CMDCMDLINE carries the /c that
+rem Explorer adds; from an existing prompt it does not, and we skip the pause.
+:hold
+echo %CMDCMDLINE% | find /i " /c" >nul && pause
+exit /b 0

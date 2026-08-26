@@ -42,6 +42,15 @@ class MegaSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "valid Mega"):
             self.choose("not-real")
 
+    def test_every_mega_the_picker_offers_is_accepted(self):
+        """The frontend draws one option per id in MEGA_TYPES, so an id the
+        picker can show but the server refuses is a dead tile."""
+        for mega in main.MEGA_TYPES:
+            with self.subTest(mega=mega):
+                self.user.mega = "byte" if mega != "byte" else "orbit"
+                self.db.commit()
+                self.assertEqual(self.choose(mega)["mega"], mega)
+
 
 if __name__ == "__main__":
     unittest.main()

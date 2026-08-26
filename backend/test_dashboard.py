@@ -949,7 +949,7 @@ class PresenceTests(unittest.TestCase):
 
     def test_signing_out_drops_the_account_immediately(self):
         # Sign-out is otherwise client-only, so without clearing last_seen the
-        # account lingered on the dashboard for the whole idle window.
+        # account lingered on the dashboard for the whole presence window.
         asyncio.run(main.logout(self.boss, self.db))
         self.assertIsNone(self.boss.last_seen)
         self.assertEqual(self.active(), [])
@@ -966,20 +966,76 @@ class PresenceTests(unittest.TestCase):
         self.db.commit()
         self.assertEqual(self.active(), [])
 
-    def test_presence_expires_with_the_idle_window(self):
+    def test_presence_expires_after_a_few_quiet_minutes(self):
         self.boss.last_seen = datetime.utcnow() - timedelta(
-            minutes=main.DEFAULT_PRESENCE_MINUTES + 1)
+            minutes=main.PRESENCE_MINUTES + 1)
         self.db.commit()
         self.assertEqual(self.active(), [])
 
-    def test_the_configured_idle_timeout_defines_the_window(self):
+    def test_activity_brings_a_stale_account_straight_back(self):
+        self.boss.last_seen = datetime.utcnow() - timedelta(
+            minutes=main.PRESENCE_MINUTES + 30)
+        self.db.commit()
+        self.assertEqual(self.active(), [])
+        auth._touch_last_seen(self.db, self.boss)
+        self.assertEqual(self.active(), ["boss"])
+
+    def test_a_long_idle_timeout_does_not_extend_presence(self):
+        """Presence is not the idle-logout window. A two-hour timeout means a
+        session survives two quiet hours; it does not mean somebody who has
+        done nothing for an hour is at their desk."""
         settings_row = get_app_settings(self.db)
         settings_row.idle_timeout_minutes = 120
         self.db.commit()
         self.boss.last_seen = datetime.utcnow() - timedelta(minutes=60)
         self.db.commit()
-        # Stale by the 15-minute default, still present under a 2-hour timeout.
-        self.assertEqual(self.active(), ["boss"])
+        self.assertEqual(self.active(), [])
+
+    def test_idle_logout_set_to_never_does_not_make_presence_permanent(self):
+        """The case that started this: closing the browser is not signing out,
+        so with no idle timeout the account would otherwise sit here as an
+        active admin until its token expired."""
+        settings_row = get_app_settings(self.db)
+        settings_row.idle_timeout_minutes = 0
+        self.db.commit()
+        self.boss.last_seen = datetime.utcnow() - timedelta(
+            minutes=main.PRESENCE_MINUTES + 1)
+        self.db.commit()
+        self.assertEqual(self.active(), [])
+
+    def test_only_addresses_used_inside_the_window_are_listed(self):
+        """An address they have stopped using drops off the list; the one they
+        moved to keeps them present. Both are on record — only the live one is
+        worth showing."""
+        import json
+        now = datetime.utcnow()
+        self.boss.active_ips = json.dumps({
+            "10.0.0.9": (now - timedelta(minutes=main.PRESENCE_MINUTES + 20)).isoformat(),
+            "10.0.0.5": (now - timedelta(minutes=1)).isoformat()})
+        self.boss.last_seen = now - timedelta(minutes=1)
+        self.db.commit()
+        rows = main._signed_in_users(self.db)
+        self.assertEqual([u["username"] for u in rows], ["boss"])
+        self.assertEqual(rows[0]["ips"], ["10.0.0.5"])
+
+    def test_an_account_quiet_on_every_address_is_gone(self):
+        import json
+        now = datetime.utcnow()
+        stale = (now - timedelta(minutes=main.PRESENCE_MINUTES + 2)).isoformat()
+        self.boss.active_ips = json.dumps({"10.0.0.9": stale, "10.0.0.5": stale})
+        self.boss.last_seen = now - timedelta(minutes=main.PRESENCE_MINUTES + 2)
+        self.db.commit()
+        self.assertEqual(self.active(), [])
+
+    def test_a_live_session_still_blocks_a_role_change(self):
+        """The role guard asks a different question — is their session live —
+        and still reads the idle-logout setting to answer it."""
+        settings_row = get_app_settings(self.db)
+        settings_row.idle_timeout_minutes = 120
+        self.db.commit()
+        self.boss.last_seen = datetime.utcnow() - timedelta(minutes=60)
+        self.db.commit()
+        self.assertLess(main._live_session_cutoff(self.db), self.boss.last_seen)
 
     def test_using_the_token_after_signing_out_marks_the_account_active_again(self):
         # There is no revocation list, so a still-valid token legitimately
